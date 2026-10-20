@@ -1,6 +1,4 @@
 import sqlite3
-import pandas as pd
-import numpy as np
 import time
 import os
 
@@ -19,26 +17,39 @@ print("Loading Schema...")
 with open("schema.sql", "r") as f:
     cursor.executescript(f.read())
 
-# 3. Generate 1,000,000 Rows of Synthetic Data
-print("Generating 1,000,000 transactions...")
-np.random.seed(42)
-n_rows = 1000000
+# CRITICAL: Turn off foreign keys AFTER schema load to allow synthetic data insertion
+cursor.execute("PRAGMA foreign_keys = OFF;")
 
-# Generate data directly into a DataFrame for fast insertion
-df = pd.DataFrame({
-    'transaction_id': [f"TX_{i}" for i in range(n_rows)],
-    'account_sk': np.random.randint(1, 100000, size=n_rows),
-    'merchant_sk': np.random.randint(1, 1000, size=n_rows),
-    'date_sk': np.random.randint(20230101, 20231231, size=n_rows),
-    'amount': np.random.uniform(10, 5000, size=n_rows),
-    'status': np.random.choice(['SETTLED', 'FAILED', 'PENDING'], size=n_rows)
-})
+# 3. Generate 1,000,000 rows natively via Recursive CTE
+print("Generating and inserting 1,000,000 transactions via SQL...")
+start_insert = time.time()
 
-# 4. Insert Data in Bulk (Fast)
-print("Inserting data into SQLite...")
-df.to_sql('fact_transactions', conn, if_exists='append', index=False)
+cursor.execute("""
+WITH RECURSIVE
+  cnt(x) AS (
+     SELECT 1
+     UNION ALL
+     SELECT x+1 FROM cnt
+      LIMIT 1000000
+  )
+INSERT INTO fact_transactions (transaction_id, account_sk, merchant_sk, date_sk, amount, status)
+SELECT
+  'TX_' || x,
+  (abs(random()) % 10000) + 1,
+  (abs(random()) % 1000) + 1,
+  20230101 + (abs(random()) % 300),
+  (abs(random()) % 5000) + 10.0,
+  CASE (abs(random()) % 3)
+    WHEN 0 THEN 'SETTLED'
+    WHEN 1 THEN 'FAILED'
+    ELSE 'PENDING'
+  END
+FROM cnt;
+""")
+conn.commit()
+print(f"Inserted 1,000,000 rows in {time.time() - start_insert:.2f} seconds.")
 
-# 5. Benchmark Query: Find top accounts by volume
+# 4. Define the Benchmark Query
 query = """
 SELECT account_sk, SUM(amount) as total_volume
 FROM fact_transactions
@@ -48,26 +59,26 @@ ORDER BY total_volume DESC
 LIMIT 10;
 """
 
-# 6. Measure Speed WITHOUT Index (Simulate a bad schema)
+# 5. Benchmark WITHOUT Index
 print("\nBenchmarking without composite index...")
 cursor.execute("DROP INDEX IF EXISTS idx_fact_composite;")
 start_time = time.time()
 cursor.execute(query)
-results_no_index = cursor.fetchall()
+cursor.fetchall() # Force execution
 time_no_index = time.time() - start_time
 print(f"Time without index: {time_no_index:.4f} seconds")
 
-# 7. Measure Speed WITH Index
+# 6. Benchmark WITH Index
 print("\nBenchmarking with composite index...")
 cursor.execute("CREATE INDEX idx_fact_composite ON fact_transactions(account_sk, date_sk, status);")
 start_time = time.time()
 cursor.execute(query)
-results_with_index = cursor.fetchall()
+cursor.fetchall() # Force execution
 time_with_index = time.time() - start_time
 print(f"Time with index: {time_with_index:.4f} seconds")
 
-# 8. Explain Query Plan (The Principal Level Proof)
-print("\nEXPLAIN QUERY PLAN (Proof of optimization):")
+# 7. Show Execution Plan
+print("\nEXPLAIN QUERY PLAN:")
 cursor.execute(f"EXPLAIN QUERY PLAN {query}")
 for row in cursor.fetchall():
     print(row)
